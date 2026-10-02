@@ -388,6 +388,17 @@
           "type": "boolean",
           "default": true,
           "description": "Log all ACP protocol traffic to the output channel."
+        },
+        "acp.inlineCompletion.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Copilot-style ghost-text inline completion, served by the connected ACP agent."
+        },
+        "acp.inlineCompletion.minTriggerChars": {
+          "type": "number",
+          "default": 12,
+          "minimum": 0,
+          "description": "Minimum characters of prefix on the current line before a completion is requested."
         }
       }
     }
