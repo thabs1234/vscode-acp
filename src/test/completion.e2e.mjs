@@ -5,10 +5,11 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import assert from 'node:assert';
 
-const HERMES =
-  'C:\\Users\\Thabang\\AppData\\Local\\hermes\\installs\\b9ab7eb3da19e021\\environments\\d3e304a6be9e4e478c9166d7be1a1d03\\venv\\Scripts\\hermes.exe';
+// Resolve hermes from PATH so an upgrade or reinstall does not break the
+// check; HERMES_BIN overrides it.
+const HERMES = process.env.HERMES_BIN || 'hermes';
 
-const child = spawn(HERMES, ['acp'], { stdio: ['pipe', 'pipe', 'inherit'] });
+const child = spawn(HERMES, ['acp'], { stdio: ['pipe', 'pipe', 'inherit'], shell: true });
 child.stdin.setDefaultEncoding('utf8');
 
 let nextId = 1;
