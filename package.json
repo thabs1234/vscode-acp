@@ -366,7 +366,10 @@
             "MiniMax Code": {
               "command": "npx",
               "args": [
+                "-y",
+                "-p",
                 "@minimax-ai/code@latest",
+                "mcode",
                 "acp"
               ],
               "env": {}
