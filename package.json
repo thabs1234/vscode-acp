@@ -411,7 +411,8 @@
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
     "lint": "eslint src --max-warnings 0",
-    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check:completion": "tsc -p . --outDir out && node src/test/completion.check.js",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint && npm run check:completion",
     "test": "vscode-test"
   },
   "dependencies": {
