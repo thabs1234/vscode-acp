@@ -400,7 +400,8 @@
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
     "lint": "eslint src --max-warnings 0",
-    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check:toolcontent": "node src/test/toolcallcontent.check.js",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint && npm run check:toolcontent",
     "test": "vscode-test"
   },
   "dependencies": {
