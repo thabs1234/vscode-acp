@@ -1,15 +1,44 @@
 // End-to-end check of the inline-completion path, using the exact SDK the
 // extension uses (@agentclientprotocol/sdk 0.21.1) and the exact compiled
-// parseCompletion() from the built extension. Run:  node src/test/completion.e2e.js
+// parseCompletion() from the built extension. Run:  node src/test/completion.e2e.mjs
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-// Resolve hermes from PATH so an upgrade or reinstall does not break the
-// check; HERMES_BIN overrides it.
-const HERMES = process.env.HERMES_BIN || 'hermes';
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-const child = spawn(HERMES, ['acp'], { stdio: ['pipe', 'pipe', 'inherit'], shell: true });
+// Locate hermes: HERMES_BIN wins, else the newest committed environment, else
+// PATH. Never pin an environment id — ids are regenerated on every update and
+// `hermes pm repair`, so a hardcoded venv path goes stale and the spawn fails.
+function findHermes() {
+  if (process.env.HERMES_BIN) return process.env.HERMES_BIN;
+  const installs = path.join(os.homedir(), 'AppData', 'Local', 'hermes', 'installs');
+  try {
+    const candidates = [];
+    for (const install of fs.readdirSync(installs)) {
+      const envs = path.join(installs, install, 'environments');
+      for (const env of fs.readdirSync(envs)) {
+        const exe = path.join(envs, env, 'venv', 'Scripts', 'hermes.exe');
+        if (fs.existsSync(exe)) candidates.push({ exe, mtime: fs.statSync(exe).mtimeMs });
+      }
+    }
+    candidates.sort((a, b) => b.mtime - a.mtime);
+    if (candidates.length) return candidates[0].exe;
+  } catch {
+    // No installs tree (non-Windows, or Hermes not installed) — fall through.
+  }
+  return 'hermes';
+}
+
+const HERMES = findHermes();
+
+// No shell: the resolved path is a real .exe, and cmd.exe wrapping both leaks a
+// stray process on kill() and risks mangling the JSON-RPC stream.
+const child = spawn(HERMES, ['acp'], { stdio: ['pipe', 'pipe', 'inherit'] });
 child.stdin.setDefaultEncoding('utf8');
 
 let nextId = 1;
@@ -53,7 +82,7 @@ await call('initialize', {
 console.log('ok  initialize');
 
 const { sessionId } = await call('session/new', {
-  cwd: 'C:\\Users\\Thabang\\Downloads\\vscode-acp',
+  cwd: REPO,
   mcpServers: [],
 });
 assert.ok(sessionId, 'session/new must return a sessionId');

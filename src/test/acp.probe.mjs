@@ -3,8 +3,41 @@
 // Run: node src/test/acp.probe.mjs
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HERMES = 'C:\\Users\\Thabang\\AppData\\Local\\hermes\\bin\\hermes.exe';
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+// Locate hermes: HERMES_BIN wins, else the newest committed environment, else
+// PATH. Never pin an environment id — ids are regenerated on every update and
+// `hermes pm repair`, so a hardcoded venv path goes stale and the spawn fails.
+function findHermes() {
+  if (process.env.HERMES_BIN) return process.env.HERMES_BIN;
+  const base = path.join(os.homedir(), 'AppData', 'Local', 'hermes');
+  try {
+    const candidates = [];
+    // envs/*/venv/Scripts/hermes.exe — the committed-environment binary
+    for (const install of fs.readdirSync(path.join(base, 'installs'))) {
+      const envs = path.join(base, 'installs', install, 'environments');
+      for (const env of fs.readdirSync(envs)) {
+        const exe = path.join(envs, env, 'venv', 'Scripts', 'hermes.exe');
+        if (fs.existsSync(exe)) candidates.push({ exe, mtime: fs.statSync(exe).mtimeMs });
+      }
+    }
+    // bin/hermes.exe — the always-current launcher
+    const launcher = path.join(base, 'bin', 'hermes.exe');
+    if (fs.existsSync(launcher)) candidates.push({ exe: launcher, mtime: fs.statSync(launcher).mtimeMs });
+    candidates.sort((a, b) => b.mtime - a.mtime);
+    if (candidates.length) return candidates[0].exe;
+  } catch {
+    // No installs tree (non-Windows, or Hermes not installed) — fall through.
+  }
+  return 'hermes';
+}
+
+const HERMES = findHermes();
 
 const child = spawn(HERMES, ['acp'], { stdio: ['pipe', 'pipe', 'pipe'] });
 let err = '';
@@ -45,7 +78,7 @@ try {
     (init?.agentCapabilities ? 'yes' : 'n/a'));
 
   const { sessionId } = await call('session/new', {
-    cwd: 'C:\\Users\\Thabang\\Downloads\\vscode-acp',
+    cwd: REPO,
     mcpServers: [],
   });
   if (!sessionId) throw new Error('no sessionId from session/new');
