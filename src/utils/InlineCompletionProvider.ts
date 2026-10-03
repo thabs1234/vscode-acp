@@ -8,7 +8,9 @@ import * as vscode from 'vscode';
  *  - Completions never enter the visible chat. Completions run on a
  *    dedicated hidden ACP session kept out of the session tree/history.
  *  - A new keystroke aborts the in-flight request (AbortController), so we
- *    never render stale ghost text after the user has moved on.
+ *    never render stale ghost text after the user has moved on — and the
+ *    agent is told to cancel, so the queue is freed immediately rather than
+ *    blocking behind an abandoned turn.
  *  - Requests are serialised through a queue so a burst of keystrokes
  *    cannot interleave two prompts on the same hidden session.
  *  - Cached per (file, line, prefix) with an LRU bound, so repeated
@@ -20,9 +22,11 @@ import * as vscode from 'vscode';
  */
 
 const CACHE_MAX = 256;
-const MIN_PREFIX_LEN = 12;
 const MAX_INSERT_CHARS = 2000;
 const REQUEST_TIMEOUT_MS = 8000;
+
+/** Runs one completion prompt on a hidden ACP session. */
+export type SendPrompt = (text: string, signal: AbortSignal) => Promise<string>;
 
 export class InlineCompletionProvider implements vscode.InlineCompletionItemProvider {
   private readonly cache = new Map<string, string>();
@@ -30,13 +34,20 @@ export class InlineCompletionProvider implements vscode.InlineCompletionItemProv
   private queued: Promise<unknown> = Promise.resolve();
   private disposed = false;
 
-  /** @param sendPrompt Runs one completion prompt on a hidden ACP session. */
-  constructor(private readonly sendPrompt: (text: string) => Promise<string>) {}
+  /**
+   * @param sendPrompt Runs one completion prompt on a hidden ACP session.
+   * @param minTriggerChars Minimum line-prefix length before we ask the agent.
+   */
+  constructor(
+    private readonly sendPrompt: SendPrompt,
+    private readonly minTriggerChars: () => number = () => 0,
+  ) {}
 
   /** Drop cached completions when the active agent/session changes. */
   onAgentChanged(): void {
     this.cache.clear();
     this.inFlight?.abort();
+    this.inFlight = null;
   }
 
   async provideInlineCompletionItems(
@@ -49,11 +60,15 @@ export class InlineCompletionProvider implements vscode.InlineCompletionItemProv
       return [];
     }
     // The user's new keystroke is what cancels this request.
-    const abort = token.onCancellationRequested(() => this.inFlight?.abort());
+    const controller = new AbortController();
+    const sub = token.onCancellationRequested(() => controller.abort());
     try {
-      return this.toItems(await this.complete(document, position));
+      return this.toItems(await this.complete(document, position, controller.signal));
     } finally {
-      abort.dispose();
+      sub.dispose();
+      if (this.inFlight === controller) {
+        this.inFlight = null;
+      }
     }
   }
 
@@ -61,22 +76,29 @@ export class InlineCompletionProvider implements vscode.InlineCompletionItemProv
    * Resolve the ghost text for this cursor position.
    * Returns '' when there is nothing useful to show.
    */
-  async complete(document: vscode.TextDocument, position: vscode.Position): Promise<string> {
+  async complete(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    signal: AbortSignal = new AbortController().signal,
+  ): Promise<string> {
     // Prose files: ghost text is noise, not a code completion.
     if (document.languageId === 'markdown' || document.languageId === 'plaintext') {
+      return '';
+    }
+    if (signal.aborted) {
       return '';
     }
 
     const prefix = document.getText(
       new vscode.Range(new vscode.Position(position.line, 0), position),
     );
-    if (prefix.trim().length < MIN_PREFIX_LEN) {
+    if (prefix.trim().length < this.minTriggerChars()) {
       return '';
     }
 
     const key = `${document.uri.toString()}:${position.line}:${position.character}:${prefix.length}`;
     const hit = this.cache.get(key);
-    if (hit) {
+    if (hit !== undefined) {
       this.cache.delete(key); // refresh LRU recency
       this.cache.set(key, hit);
       return hit;
@@ -85,26 +107,33 @@ export class InlineCompletionProvider implements vscode.InlineCompletionItemProv
     this.inFlight?.abort();
     const controller = new AbortController();
     this.inFlight = controller;
+    // An external cancellation (the host token) must also abort our request.
+    const relay = () => controller.abort();
+    signal.addEventListener('abort', relay, { once: true });
 
     const prompt = buildPrompt(document, position, prefix);
     const completion = await this.enqueue(async () => {
-      if (controller.signal.aborted) {
-        return undefined;
-      }
-      let raw: string;
       try {
-        raw = await withTimeout(this.sendPrompt(prompt), REQUEST_TIMEOUT_MS);
-      } catch {
-        return undefined; // agent busy or unavailable: no ghost text, no error popup
+        if (controller.signal.aborted) {
+          return undefined;
+        }
+        let raw: string;
+        try {
+          raw = await withTimeout(this.sendPrompt(prompt, controller.signal), REQUEST_TIMEOUT_MS);
+        } catch {
+          return undefined; // agent busy or unavailable: no ghost text, no error popup
+        }
+        if (controller.signal.aborted) {
+          return undefined;
+        }
+        const parsed = parseCompletion(raw);
+        if (parsed) {
+          this.cachePut(key, parsed);
+        }
+        return parsed;
+      } finally {
+        signal.removeEventListener('abort', relay);
       }
-      if (controller.signal.aborted) {
-        return undefined;
-      }
-      const parsed = parseCompletion(raw);
-      if (parsed) {
-        this.cachePut(key, parsed);
-      }
-      return parsed;
     });
 
     return completion ?? '';
@@ -114,6 +143,7 @@ export class InlineCompletionProvider implements vscode.InlineCompletionItemProv
     this.disposed = true;
     this.cache.clear();
     this.inFlight?.abort();
+    this.inFlight = null;
   }
 
   /** One queue slot: requests never run concurrently on the hidden session. */

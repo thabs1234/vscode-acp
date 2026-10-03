@@ -64,6 +64,11 @@ export function activate(context: vscode.ExtensionContext): void {
   completionService.activate();
   context.subscriptions.push(completionService);
 
+  // Ghost text is agent-specific: a connect/disconnect invalidates both the
+  // cached completions and the hidden session they were served from.
+  sessionManager.on('agent-connected', () => completionService.onAgentChanged());
+  sessionManager.on('agent-disconnected', () => completionService.onAgentChanged());
+
   // Notify chat webview when active session changes
   sessionManager.on('active-session-changed', () => {
     chatWebviewProvider.notifyActiveSessionChanged();

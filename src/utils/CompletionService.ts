@@ -1,10 +1,13 @@
 import * as vscode from 'vscode';
 import { ConnectionManager } from '../core/ConnectionManager';
+import type { ConnectionInfo } from '../core/ConnectionManager';
 import { SessionUpdateHandler, SessionUpdateListener } from '../handlers/SessionUpdateHandler';
 import { InlineCompletionProvider } from './InlineCompletionProvider';
 import { log, logError } from './Logger';
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
+
+const DEFAULT_MIN_TRIGGER_CHARS = 12;
 
 /**
  * Wires Copilot-style ghost-text completion to the connected ACP agent.
@@ -27,35 +30,68 @@ export class CompletionService implements vscode.Disposable {
   private readonly provider: InlineCompletionProvider;
   private readonly listener: SessionUpdateListener;
   private registration: vscode.Disposable | undefined;
+  private configWatcher: vscode.Disposable | undefined;
   private sessionId: string | null = null;
   private starting: Promise<string | null> | null = null;
+  /** Agent that owns `sessionId`, so a same-agent reconnect keeps it. */
+  private sessionAgentId: string | null = null;
   /** Reply text for the in-flight prompt on the hidden session. */
   private buffer = '';
-  private collecting = false;
+  /**
+   * Generation number of the request allowed to append to `buffer`, or 0
+   * when nothing is collecting. Chunks carry only a sessionId — both the
+   * live and an abandoned request share the hidden session — so the
+   * generation is what stops a cancelled turn's trailing chunks from
+   * landing in the next turn's ghost text.
+   */
+  private collecting = 0;
+  private generation = 0;
 
   constructor(
     private readonly connectionManager: ConnectionManager,
     private readonly sessionUpdateHandler: SessionUpdateHandler,
   ) {
-    this.provider = new InlineCompletionProvider(text => this.complete(text));
+    this.provider = new InlineCompletionProvider(
+      (text, signal) => this.complete(text, signal),
+      () => this.config().get<number>('inlineCompletion.minTriggerChars', DEFAULT_MIN_TRIGGER_CHARS),
+    );
     this.listener = (update: SessionNotification) => this.onUpdate(update);
   }
 
   activate(): void {
     this.sessionUpdateHandler.addListener(this.listener);
-    this.registration = vscode.languages.registerInlineCompletionItemProvider(
-      { scheme: 'file', pattern: '**/*' },
-      this.provider,
-    );
-    log('CompletionService: inline completion provider registered');
+    this.syncRegistration();
+    this.configWatcher = vscode.workspace.onDidChangeConfiguration(e => {
+      if (!e.affectsConfiguration('acp.inlineCompletion')) {
+        return;
+      }
+      const wasEnabled = this.registration !== undefined;
+      this.syncRegistration();
+      // A changed trigger length or a fresh enable invalidates cached text.
+      if (wasEnabled) {
+        this.provider.onAgentChanged();
+      }
+    });
+    log('CompletionService: activated');
   }
 
-  /** Drop cached ghost text when the user switches agent. */
+  /** Drop cached ghost text when the active agent changes. */
   onAgentChanged(): void {
     this.provider.onAgentChanged();
+    const agentId = this.currentAgentId() ?? null;
+    if (agentId === this.sessionAgentId) {
+      return;
+    }
+    // The hidden session belongs to the old agent (or a dead one) and will
+    // never answer again — drop it so the next request re-opens.
+    this.sessionId = null;
+    this.sessionAgentId = agentId;
+    this.buffer = '';
+    this.collecting = 0;
   }
 
   dispose(): void {
+    this.configWatcher?.dispose();
     this.registration?.dispose();
     this.sessionUpdateHandler.removeListener(this.listener);
     this.provider.dispose();
@@ -67,12 +103,40 @@ export class CompletionService implements vscode.Disposable {
   }
 
   /**
+   * Register or unregister the ghost-text provider to match
+   * `acp.inlineCompletion.enabled`.
+   */
+  private syncRegistration(): void {
+    const enabled = this.config().get<boolean>('inlineCompletion.enabled', true);
+    if (enabled && !this.registration) {
+      this.registration = vscode.languages.registerInlineCompletionItemProvider(
+        { scheme: 'file', pattern: '**/*' },
+        this.provider,
+      );
+      log('CompletionService: inline completion enabled');
+    } else if (!enabled && this.registration) {
+      this.registration.dispose();
+      this.registration = undefined;
+      log('CompletionService: inline completion disabled');
+    }
+  }
+
+  private config(): vscode.WorkspaceConfiguration {
+    return vscode.workspace.getConfiguration('acp');
+  }
+
+  /**
    * Run one completion prompt on the hidden session and return the reply.
    * Creates the session on first use.
+   *
+   * `signal` is the caller's cancellation. When it fires we race it against
+   * the ACP `prompt()` call so the caller's queue is freed immediately
+   * instead of waiting out an abandoned turn, and we tell the agent to
+   * cancel so it stops streaming instead of burning tokens on dead text.
    */
-  private async complete(text: string): Promise<string> {
+  private async complete(text: string, signal: AbortSignal): Promise<string> {
     const sessionId = await this.ensureSession();
-    if (!sessionId) {
+    if (!sessionId || signal.aborted) {
       return '';
     }
     const agentId = this.currentAgentId();
@@ -81,19 +145,34 @@ export class CompletionService implements vscode.Disposable {
       return '';
     }
 
+    const gen = ++this.generation;
     this.buffer = '';
-    this.collecting = true;
-    try {
-      await connInfo.connection.prompt({
-        sessionId,
-        prompt: [{ type: 'text', text }],
+    this.collecting = gen;
+
+    const turn = connInfo.connection
+      .prompt({ sessionId, prompt: [{ type: 'text', text }] })
+      .catch(e => {
+        logError('Inline completion prompt failed', e);
       });
-    } catch (e) {
-      logError('Inline completion prompt failed', e);
+
+    try {
+      await Promise.race([turn, abortRace(signal)]);
     } finally {
-      this.collecting = false;
+      if (signal.aborted) {
+        this.cancelTurn(connInfo, sessionId);
+      }
+      if (this.collecting === gen) {
+        this.collecting = 0;
+      }
     }
-    return this.buffer;
+    return gen === this.generation ? this.buffer : '';
+  }
+
+  /** Best-effort: the turn is being abandoned, so its result is unwanted. */
+  private cancelTurn(connInfo: ConnectionInfo, sessionId: string): void {
+    connInfo.connection
+      .cancel({ sessionId })
+      .catch(e => logError('Inline completion cancel failed', e));
   }
 
   /**
@@ -128,11 +207,13 @@ export class CompletionService implements vscode.Disposable {
       return this.starting;
     }
     this.starting = this.startSession()
-      .then(id => {
-        if (id) {
-          this.sessionId = id;
+      .then(started => {
+        if (started) {
+          this.sessionId = started.sessionId;
+          this.sessionAgentId = started.agentId;
+          return started.sessionId;
         }
-        return id;
+        return null;
       })
       .catch(e => {
         logError('Failed to create inline completion session', e);
@@ -144,15 +225,15 @@ export class CompletionService implements vscode.Disposable {
     return this.starting;
   }
 
-  private async startSession(): Promise<string | null> {
+  private async startSession(): Promise<{ sessionId: string; agentId: string } | null> {
     const agentId = this.currentAgentId();
     const connInfo = agentId ? this.connectionManager.getConnection(agentId) : undefined;
-    if (!connInfo) {
+    if (!agentId || !connInfo) {
       return null;
     }
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
     const res = await connInfo.connection.newSession({ cwd, mcpServers: [] });
-    return res.sessionId;
+    return { sessionId: res.sessionId, agentId };
   }
 
   /**
@@ -161,4 +242,14 @@ export class CompletionService implements vscode.Disposable {
   private currentAgentId(): string | undefined {
     return this.connectionManager.getAnyConnectedAgentId();
   }
+}
+
+/** Resolves when `signal` aborts, so it can win a race against a pending turn. */
+function abortRace(signal: AbortSignal): Promise<'aborted'> {
+  if (signal.aborted) {
+    return Promise.resolve('aborted');
+  }
+  return new Promise<'aborted'>(resolve => {
+    signal.addEventListener('abort', () => resolve('aborted'), { once: true });
+  });
 }
