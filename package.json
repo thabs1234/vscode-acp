@@ -284,7 +284,7 @@
             "GitHub Copilot": {
               "command": "npx",
               "args": [
-                "@github/copilot-language-server@latest",
+                "@github/copilot@latest",
                 "--acp"
               ],
               "env": {}
@@ -334,7 +334,49 @@
             "Codex CLI": {
               "command": "npx",
               "args": [
-                "@zed-industries/codex-acp@latest"
+                "@agentclientprotocol/codex-acp@latest"
+              ],
+              "env": {}
+            },
+            "Cline": {
+              "command": "npx",
+              "args": [
+                "cline@latest",
+                "--acp"
+              ],
+              "env": {}
+            },
+            "Factory Droid": {
+              "command": "npx",
+              "args": [
+                "droid@latest",
+                "exec",
+                "--output-format",
+                "acp-daemon"
+              ],
+              "env": {}
+            },
+            "GLM Agent": {
+              "command": "npx",
+              "args": [
+                "glm-acp-agent@latest"
+              ],
+              "env": {}
+            },
+            "MiniMax Code": {
+              "command": "npx",
+              "args": [
+                "@minimax-ai/code@latest",
+                "acp"
+              ],
+              "env": {}
+            },
+            "Grok Build": {
+              "command": "npx",
+              "args": [
+                "@xai-official/grok@latest",
+                "agent",
+                "stdio"
               ],
               "env": {}
             },
