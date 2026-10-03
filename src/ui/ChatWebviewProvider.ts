@@ -648,6 +648,22 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    .tool-call-inline .tc-content {
+      flex-basis: 100%;
+      margin: 6px 0 0 22px;
+      padding: 8px 10px;
+      border-left: 2px solid var(--vscode-panel-border);
+      background: var(--vscode-textCodeBlock-background);
+      border-radius: 0 3px 3px 0;
+      font-family: var(--vscode-editor-font-family);
+      font-size: var(--vscode-editor-font-size);
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 320px;
+      overflow-y: auto;
+      user-select: text;
+    }
+    .tool-call-inline .tc-content:empty { display: none; }
 
     /* Legacy standalone tool-call card (for history restore) */
     .tool-call {
@@ -1288,7 +1304,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             addThoughtDOM(item.text, item.durationSec || 0);
             break;
           case 'toolCall':
-            addToolCallDOM(item.toolCallId, item.title, item.status);
+            addToolCallDOM(item.toolCallId, item.title, item.status, item.content);
             break;
           case 'plan':
             addPlanDOM(item.plan);
@@ -2008,13 +2024,43 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    function addToolCall(toolCallId, title, status) {
-      chatHistory.push({ kind: 'toolCall', toolCallId, title, status });
-      saveState();
-      addToolCallInline(toolCallId, title, status);
+    // Flatten ACP ToolCallContent[] into displayable text. ACP nests the
+    // block one level deep: {type:"content", content:{type:"text", text}}.
+    // ponytail: text and diff are rendered; image/resource blocks are labelled, not drawn.
+    function renderToolContent(content) {
+      if (!Array.isArray(content)) return '';
+      const parts = [];
+      for (const block of content) {
+        if (!block || typeof block !== 'object') continue;
+        if (block.type === 'content') {
+          const inner = block.content;
+          if (inner && inner.type === 'text') {
+            // an empty text block is valid and must not render as [text]
+            const t = inner.text == null ? '' : String(inner.text);
+            if (t) parts.push(t);
+          } else if (inner) parts.push('[' + inner.type + ']');
+        } else if (block.type === 'diff') {
+          const filePath = block.path || '';
+          const oldLines = block.oldText ? String(block.oldText).split('\n').length : 0;
+          const newLines = block.newText ? String(block.newText).split('\n').length : 0;
+          parts.push('diff ' + filePath + ' (' + oldLines + ' -> ' + newLines + ' lines)');
+        } else if (block.type === 'terminal') {
+          parts.push('terminal ' + (block.terminalId || ''));
+        } else {
+          parts.push('[' + block.type + ']');
+        }
+      }
+      return parts.join('\n');
     }
 
-    function addToolCallInline(toolCallId, title, status) {
+    function addToolCall(toolCallId, title, status, content) {
+      const text = renderToolContent(content);
+      chatHistory.push({ kind: 'toolCall', toolCallId, title, status, content: text });
+      saveState();
+      addToolCallInline(toolCallId, title, status, text);
+    }
+
+    function addToolCallInline(toolCallId, title, status, contentText) {
       hideEmpty();
       ensureTurnTools();
       currentToolCount++;
@@ -2028,30 +2074,35 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       el.id = 'tc-' + toolCallId;
       el.innerHTML =
         '<span class="tc-icon ' + status + '">' + getStatusIcon(status) + '</span>' +
-        '<span class="tc-title">' + escapeHtml(title || 'Tool Call') + '</span>';
+        '<span class="tc-title">' + escapeHtml(title || 'Tool Call') + '</span>' +
+        (contentText ? '<span class="tc-content">' + escapeHtml(contentText) + '</span>' : '');
       currentToolsListEl.appendChild(el);
       toolCalls[toolCallId] = el;
       scrollToBottom();
     }
 
     // Fallback DOM builder for history restore (standalone card)
-    function addToolCallDOM(toolCallId, title, status) {
+    function addToolCallDOM(toolCallId, title, status, contentText) {
       hideEmpty();
       const el = document.createElement('div');
       el.className = 'tool-call';
       el.id = 'tc-' + toolCallId;
       el.innerHTML = '<span class="title">' + escapeHtml(title || 'Tool Call') + '</span>'
-        + '<span class="status-badge ' + status + '">' + status + '</span>';
+        + '<span class="status-badge ' + status + '">' + status + '</span>'
+        + (contentText ? '<div class="tc-content">' + escapeHtml(contentText) + '</div>' : '');
       messagesEl.appendChild(el);
       toolCalls[toolCallId] = el;
       scrollToBottom();
     }
 
-    function updateToolCall(toolCallId, status, title) {
+    function updateToolCall(toolCallId, status, title, content) {
+      const text = renderToolContent(content);
       for (let i = chatHistory.length - 1; i >= 0; i--) {
         if (chatHistory[i].kind === 'toolCall' && chatHistory[i].toolCallId === toolCallId) {
           chatHistory[i].status = status;
           if (title) chatHistory[i].title = title;
+          // ACP sends only changed fields, so keep the previous text otherwise
+          if (text) chatHistory[i].content = text;
           break;
         }
       }
@@ -2059,6 +2110,16 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
 
       const el = toolCalls[toolCallId] || document.getElementById('tc-' + toolCallId);
       if (!el) return;
+
+      if (text) {
+        let contentEl = el.querySelector('.tc-content');
+        if (!contentEl) {
+          contentEl = document.createElement('span');
+          contentEl.className = 'tc-content';
+          el.appendChild(contentEl);
+        }
+        if (contentEl.textContent !== text) contentEl.textContent = text;
+      }
 
       // Inline style (turn-based)
       const iconEl = el.querySelector('.tc-icon');
@@ -2478,6 +2539,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             tc.toolCallId || 'unknown',
             tc.title || 'Tool Call',
             tc.status || 'pending',
+            tc.content,
           );
           break;
         }
@@ -2487,6 +2549,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             update.toolCallId || 'unknown',
             update.status || 'completed',
             update.title,
+            update.content,
           );
           break;
         }
